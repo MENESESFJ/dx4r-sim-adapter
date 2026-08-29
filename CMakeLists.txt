@@ -36,3 +36,24 @@ target_link_libraries(dx4r_sim_adapter
 
 # Nada de pico_enable_stdio_usb: los descriptores USB son nuestros.
 pico_add_extra_outputs(dx4r_sim_adapter)
+
+# ---------------------------------------------------------------------
+# peak_probe: herramienta de un solo uso para medir el HIGH real del
+# SR2000 antes de soldar la version definitiva. No forma parte del
+# firmware final -- se flashea aparte, se usa, y se vuelve a main.c.
+# Por eso usa pico_enable_stdio_usb en vez de los descriptores propios
+# de dx4r_sim_adapter: es mas simple y no necesita ser HID.
+# ---------------------------------------------------------------------
+add_executable(peak_probe
+    tools/peak_probe/peak_probe.c
+)
+
+target_link_libraries(peak_probe
+    pico_stdlib
+    hardware_adc
+)
+
+pico_enable_stdio_usb(peak_probe 1)
+pico_enable_stdio_uart(peak_probe 0)
+
+pico_add_extra_outputs(peak_probe)

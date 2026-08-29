@@ -39,8 +39,42 @@ El objetivo es detectar la caída de tensión que provocan los picos de
 consumo de RF del SR2000; medida en VBUS, más cerca de la fuente, esa
 caída se ve amortiguada y el número miente.
 
-El divisor 1,8k/3,3k lleva 5 V a 3,24 V. El VIH del RP2040 es 2,0 V con
-Schmitt trigger, así que hay margen de sobra. No hace falta level shifter.
+El divisor 1,8k/3,3k lleva 5 V a 3,24 V. El VIH mínimo real del RP2040
+a IOVDD=3,3 V es 1,6 V (no 2,0 V — ese número es del BCM2835, el chip
+de la Raspberry Pi original, no del RP2040). Con margen de sobra en
+cualquier caso. No hace falta level shifter.
+
+## Antes de soldar: verificar el HIGH real del SR2000
+
+El cálculo de arriba asume que el SR2000 entrega un HIGH de ~5 V (su
+alimentación). Si en cambio el receptor usa lógica interna de 3,3 V y
+solo está *alimentado* a 5 V, el mismo divisor entrega ~2,1 V en el
+pin en vez de ~3,2 V. Ambos casos son seguros — el margen sobre VIH
+va de +1,6 V en el mejor caso a +0,5 V en el peor — pero es un factor
+~3x de diferencia que no vale la pena asumir cuando se puede medir.
+
+**Cómo medirlo sin osciloscopio**: el propio Pico sirve de instrumento.
+
+1. Dejá el mismo divisor 1,8k/3,3k de CH1, pero mové su salida de
+   GP2 a GP26 (ADC0) por un momento.
+2. Compilá y flasheá `peak_probe.uf2` (target separado, ver más abajo)
+   en vez de `dx4r_sim_adapter.uf2`.
+3. Abrí una terminal serie a 115200 baudios.
+4. Movete el stick de steering a fondo, en las dos direcciones,
+   durante 5-10 segundos.
+5. Anotá el `PICO=` que se imprime cada segundo.
+
+El ADC del RP2040 muestrea muchísimo más rápido que el pulso de
+~1-2 ms que hay que capturar, así que un peak-hold en software agarra
+el HIGH real sin necesitar equipo aparte.
+
+Con el resultado: ~3,2 V confirma HIGH real de 5 V, quedate con el
+divisor tal cual está. ~2,1 V confirma HIGH real de 3,3 V — sigue
+siendo seguro, así que tampoco hace falta cambiar nada, pero ya no es
+una suposición.
+
+Terminada la medición, volvé a mover el cable a GP2 y reflasheá
+`dx4r_sim_adapter.uf2`.
 
 Poné 100 µF entre VBUS y GND lo más cerca posible del receptor. Los picos
 de consumo de RF pueden hacer caer la línea lo suficiente como para que
@@ -177,7 +211,13 @@ cmake ..
 make -j
 ```
 
-Sale `dx4r_sim_adapter.uf2`. BOOTSEL, arrastrar, listo.
+Salen dos `.uf2`:
+
+- `dx4r_sim_adapter.uf2` — el firmware real.
+- `peak_probe.uf2` — la herramienta de medición de arriba, para usar
+  una sola vez antes de soldar.
+
+BOOTSEL, arrastrar el que corresponda, listo.
 
 ## Calibración
 
