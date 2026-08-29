@@ -93,7 +93,11 @@ static void render(const ui_state_t *s) {
     ssd1306_clear();
 
     /* --- encabezado --- */
-    bool link = s->linked[0] || s->linked[1];
+    /* AND, no OR: alineado con build_report() en main.c. Con OR, el
+     * display podia seguir diciendo "LINK" con throttle en failsafe
+     * mientras el HID ya mandaba ceros -- la pantalla mentia justo
+     * cuando mas importaba que no mintiera. */
+    bool link = s->linked[0] && s->linked[1];
     if (!link) {
         snprintf(line, sizeof(line), "DX4R PRO   SIN ENLACE");
     } else {

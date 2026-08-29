@@ -236,11 +236,22 @@ static void poll_channels(void) {
 static void build_report(uint8_t *rep) {
     int16_t axes[CH_COUNT];
 
+    /* Enlace global, no por canal. El SR2000 no deja de emitir el
+     * throttle en failsafe -- solo los demas canales -- asi que
+     * chan[THROTTLE].linked puede seguir en true con el enlace RF
+     * caido. El indicador confiable es que CUALQUIER canal deje de
+     * llegar: si steering se calla, el enlace esta muerto sin importar
+     * lo que reporte throttle. Por eso es AND, no por-canal. */
+    bool link_ok = true;
+    for (uint i = 0; i < CH_COUNT; i++) {
+        if (!chan[i].linked) { link_ok = false; break; }
+    }
+
     for (uint i = 0; i < CH_COUNT; i++) {
         channel_t *ch = &chan[i];
         int16_t v = 0;
 
-        if (ch->linked && ch->centered) {
+        if (link_ok && ch->centered) {
             v = scale_axis(ch, ch->last_ticks);
             if (ch->invert) v = (v == INT16_MIN) ? INT16_MAX : (int16_t)(-v);
         }
