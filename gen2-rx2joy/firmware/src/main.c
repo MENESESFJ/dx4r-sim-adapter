@@ -1,269 +1,78 @@
 /*
- * DX4R PRO Sim Adapter — firmware V1
+ * RX2JOY — firmware gen2
  *
- * Spektrum DX4R Pro -> SR2000 (5,5 ms, 2 canales) -> RP2040 -> USB HID -> VRC Pro
+ * Radio -> receptor (PWM / S.BUS / i-BUS) -> RP2040 -> USB HID -> VRC Pro
  *
- * Decisiones de diseño:
- *  - Captura por PIO, 20 ns de resolución. Sin micros(), sin attachInterrupt().
- *  - Sin filtro. Ninguno. Si despues de medir el jitter resulta necesario,
- *    se agrega el minimo indispensable (ver DEADBAND_TICKS).
- *  - HID de 16 bits con signo. El escalado no agrega cuantizacion propia,
- *    aunque la resolucion efectiva la ponga el enlace DSMR (~11 bits).
- *  - bInterval = 1 ms en el descriptor HID (ver usb_descriptors.c).
- *  - Calibracion automatica: el centro se captura cuando los controles
- *    estan quietos, y el rango se expande solo a medida que manejas.
- *    Recalibracion manual: boton fisico en GP15 (activo en bajo, pull-up
- *    interno) o tecla 'c' por consola CDC — ambos llaman al mismo punto.
- *  - Puerto CDC para instrumentacion: volcado de ticks crudos para
- *    medir la resolucion real del enlace (ver analiza_pulsos.py).
+ * Decisiones de diseño heredadas del v1 y que se mantienen:
+ *  - Captura de PWM por PIO, 20 ns de resolucion. Sin micros(), sin
+ *    attachInterrupt().
+ *  - Sin filtro digital. Ninguno. Si el jitter lo exige, se agrega el
+ *    minimo indispensable (ver DEADBAND_TICKS en rx2joy.h).
+ *  - HID de 16 bits con signo, para que el escalado no agregue
+ *    cuantizacion propia.
+ *  - bInterval = 1 ms en el descriptor HID.
+ *  - Puerto CDC para instrumentacion.
+ *
+ * Nuevo en gen2:
+ *  - Tres protocolos de entrada, elegidos por jumper en GP14.
+ *  - Timeout de enlace calculado sobre el periodo real de trama en vez
+ *    de un valor fijo.
+ *  - Failsafe detectado por el bit de la trama S.BUS, no solo por
+ *    ausencia de señal.
+ *  - Calibracion guardable en flash, una por modo.
+ *
+ * Botón CAL (GP15):
+ *  - pulsacion corta  -> recalibrar
+ *  - pulsacion larga  -> guardar la calibracion actual en flash
  */
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
-#include "hardware/pio.h"
-#include "hardware/clocks.h"
 
 #include "bsp/board.h"
 #include "tusb.h"
 
-#include "pwm_capture.pio.h"
+#include "rx2joy.h"
 #include "shared_state.h"
 #include "display.h"
 
 /* ------------------------------------------------------------------ */
-/* Configuración                                                       */
-/* ------------------------------------------------------------------ */
 
-#define PIN_CH1            2u          /* steering       */
-#define PIN_CH2            3u          /* throttle/brake */
+#define CAL_DEBOUNCE_MS   30u
+#define CAL_LONG_MS       1500u
+#define FLASH_MSG_MS      2500u
 
-#define INVERT_CH1         false
-#define INVERT_CH2         false
+#define HID_REPORT_LEN    5     /* 2 ejes int16 + 1 byte de botones */
+#define HID_HEARTBEAT_MS  20u
 
-#define PIO_CLK_HZ         100000000.0f
-#define TICKS_PER_US       50u         /* 2 ciclos PIO por iteracion */
-#define US_TO_TICKS(us)    ((uint32_t)((us) * TICKS_PER_US))
+static rx_mode_t s_mode        = MODE_PWM;
+static bool      dump_enabled  = false;
+static uint32_t  g_hid_count   = 0;
 
-/* Ventana de validacion: descarta glitches y pulsos imposibles */
-#define PULSE_MIN_TICKS    US_TO_TICKS(800)
-#define PULSE_MAX_TICKS    US_TO_TICKS(2200)
+static char      s_flash_msg[10] = { 0 };
+static uint32_t  s_flash_until   = 0;
 
-/* Calibracion de centro */
-#define CENTER_SAMPLES     32u
-#define CENTER_TOL_TICKS   US_TO_TICKS(20)
-#define INITIAL_HALF_SPAN  US_TO_TICKS(400)
-
-/* Perdida de enlace. A 5,5 ms esto son ~11 frames. */
-#define LINK_TIMEOUT_US    60000u
-
-/* Boton fisico de recalibracion. Activo en bajo, con pull-up interno:
- * no hace falta resistencia externa. */
-#define PIN_CAL_BUTTON     15u
-#define CAL_DEBOUNCE_MS    30u
-
-/* Zona muerta alrededor del centro, en ticks. 0 = sin zona muerta.
- * Empezar en 0 y subir solo si el neutro no queda quieto en joy.cpl. */
-#define DEADBAND_TICKS     0u
-
-#define CH_COUNT           2u
-
-/* ------------------------------------------------------------------ */
-/* Estado por canal                                                    */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    uint     pin;
-    uint     sm;
-    bool     invert;
-
-    /* captura */
-    uint32_t last_ticks;
-    uint32_t last_sample_us;
-    uint32_t prev_sample_us;
-    uint32_t frame_us;          /* periodo entre frames medido */
-    bool     linked;
-
-    /* calibracion */
-    bool     centered;
-    uint32_t ctr, lo, hi;
-    uint32_t cal_acc;
-    uint32_t cal_ref;
-    uint32_t cal_n;
-
-    /* estadistica */
-    uint32_t bad_count;
-} channel_t;
-
-static channel_t chan[CH_COUNT];
-static PIO       pio = pio0;
-
-static bool     dump_enabled = false;
-static uint32_t g_hid_count  = 0;   /* reportes enviados, se resetea cada 1 s */
-
-/* ------------------------------------------------------------------ */
-
-static inline uint32_t absdiff(uint32_t a, uint32_t b) {
-    return (a > b) ? (a - b) : (b - a);
-}
-
-static void channel_reset_cal(channel_t *ch) {
-    ch->centered = false;
-    ch->cal_acc  = 0;
-    ch->cal_n    = 0;
-    ch->cal_ref  = 0;
-    ch->lo = ch->hi = ch->ctr = 0;
-}
-
-/* Punto unico de recalibracion: lo llaman tanto el boton fisico
- * como la tecla 'c' de la consola CDC, asi que se comportan igual. */
-static void request_recalibration(void) {
-    for (uint i = 0; i < CH_COUNT; i++) channel_reset_cal(&chan[i]);
-}
-
-static void channel_init(channel_t *ch, uint pin, uint sm, bool invert, uint offset) {
-    memset(ch, 0, sizeof(*ch));
-    ch->pin    = pin;
-    ch->sm     = sm;
-    ch->invert = invert;
-    channel_reset_cal(ch);
-    pwm_capture_program_init(pio, sm, offset, pin, PIO_CLK_HZ);
-}
-
-/* Escalado partido en dos tramos, para que el centro caiga exacto en 0
- * aunque el recorrido no sea simetrico (que en un gatillo nunca lo es). */
-static int16_t scale_axis(const channel_t *ch, uint32_t t) {
-    if (t >= ch->ctr) {
-        uint32_t d    = t - ch->ctr;
-        uint32_t span = ch->hi - ch->ctr;
-        if (d <= DEADBAND_TICKS || span == 0) return 0;
-        d -= DEADBAND_TICKS;
-        if (span <= DEADBAND_TICKS) return 0;
-        span -= DEADBAND_TICKS;
-        int64_t v = ((int64_t)d * 32767) / span;
-        return (int16_t)(v > 32767 ? 32767 : v);
-    } else {
-        uint32_t d    = ch->ctr - t;
-        uint32_t span = ch->ctr - ch->lo;
-        if (d <= DEADBAND_TICKS || span == 0) return 0;
-        d -= DEADBAND_TICKS;
-        if (span <= DEADBAND_TICKS) return 0;
-        span -= DEADBAND_TICKS;
-        int64_t v = ((int64_t)d * 32768) / span;
-        return (int16_t)(-(v > 32768 ? 32768 : v));
-    }
-}
-
-static void channel_feed(channel_t *ch, uint32_t t, uint32_t now) {
-    if (t < PULSE_MIN_TICKS || t > PULSE_MAX_TICKS) {
-        ch->bad_count++;
-        return;
-    }
-
-    ch->prev_sample_us = ch->last_sample_us;
-    ch->last_sample_us = now;
-    ch->last_ticks     = t;
-    if (ch->linked) {
-        ch->frame_us = now - ch->prev_sample_us;
-    }
-    ch->linked = true;
-
-    if (!ch->centered) {
-        /* Buscamos CENTER_SAMPLES muestras seguidas dentro de una ventana
-         * estrecha. Si el usuario mueve algo, se reinicia la cuenta. */
-        if (ch->cal_n == 0) {
-            ch->cal_ref = t;
-            ch->cal_acc = t;
-            ch->cal_n   = 1;
-        } else if (absdiff(t, ch->cal_ref) <= CENTER_TOL_TICKS) {
-            ch->cal_acc += t;
-            ch->cal_n++;
-            if (ch->cal_n >= CENTER_SAMPLES) {
-                ch->ctr      = ch->cal_acc / ch->cal_n;
-                ch->lo       = ch->ctr - INITIAL_HALF_SPAN;
-                ch->hi       = ch->ctr + INITIAL_HALF_SPAN;
-                ch->centered = true;
-            }
-        } else {
-            ch->cal_acc = 0;
-            ch->cal_n   = 0;
-        }
-    } else {
-        /* El rango solo se expande. Mueve volante y gatillo a los topes
-         * una vez y queda calibrado para la sesion. */
-        if (t < ch->lo) ch->lo = t;
-        if (t > ch->hi) ch->hi = t;
-    }
-}
-
-static void poll_channels(void) {
-    uint32_t now = time_us_32();
-
-    for (uint i = 0; i < CH_COUNT; i++) {
-        channel_t *ch = &chan[i];
-
-        /* Drenar la FIFO completa: nos interesa la muestra mas nueva,
-         * no ponernos al dia con una cola vieja. */
-        while (!pio_sm_is_rx_fifo_empty(pio, ch->sm)) {
-            uint32_t t = pio_sm_get(pio, ch->sm);
-            channel_feed(ch, t, now);
-
-            if (dump_enabled && tud_cdc_connected()) {
-                char line[48];
-                int n = snprintf(line, sizeof(line), "%u,%u,%u\n",
-                                 (unsigned)i, (unsigned)t, (unsigned)ch->frame_us);
-                if (n > 0) tud_cdc_write(line, (uint32_t)n);
-            }
-        }
-
-        if (ch->linked && (uint32_t)(now - ch->last_sample_us) > LINK_TIMEOUT_US) {
-            ch->linked = false;
-        }
-    }
-
-    if (dump_enabled && tud_cdc_connected()) tud_cdc_write_flush();
+static void set_flash_msg(const char *m) {
+    snprintf(s_flash_msg, sizeof(s_flash_msg), "%s", m);
+    s_flash_until = board_millis() + FLASH_MSG_MS;
 }
 
 /* ------------------------------------------------------------------ */
 /* Reporte HID                                                         */
 /* ------------------------------------------------------------------ */
 
-#define HID_REPORT_LEN 5   /* 2 ejes int16 + 1 byte de botones */
-
 static void build_report(uint8_t *rep) {
     int16_t axes[CH_COUNT];
-
-    /* Enlace global, no por canal. El SR2000 no deja de emitir el
-     * throttle en failsafe -- solo los demas canales -- asi que
-     * chan[THROTTLE].linked puede seguir en true con el enlace RF
-     * caido. El indicador confiable es que CUALQUIER canal deje de
-     * llegar: si steering se calla, el enlace esta muerto sin importar
-     * lo que reporte throttle. Por eso es AND, no por-canal. */
-    bool link_ok = true;
-    for (uint i = 0; i < CH_COUNT; i++) {
-        if (!chan[i].linked) { link_ok = false; break; }
-    }
-
-    for (uint i = 0; i < CH_COUNT; i++) {
-        channel_t *ch = &chan[i];
-        int16_t v = 0;
-
-        if (link_ok && ch->centered) {
-            v = scale_axis(ch, ch->last_ticks);
-            if (ch->invert) v = (v == INT16_MIN) ? INT16_MAX : (int16_t)(-v);
-        }
-        axes[i] = v;
-    }
-
+    for (uint32_t i = 0; i < CH_COUNT; i++) axes[i] = channel_axis(i);
     memcpy(rep, axes, sizeof(axes));
-    rep[4] = 0;   /* botones sin usar; reservados para CH3/CH4 a 11 ms */
+    rep[4] = 0;   /* botones sin usar; reservados para CH3/CH4 */
 }
 
 static void send_hid(void) {
-    static uint8_t prev[HID_REPORT_LEN];
+    static uint8_t  prev[HID_REPORT_LEN];
     static uint32_t last_tx_ms = 0;
 
     if (!tud_hid_ready()) return;
@@ -274,9 +83,9 @@ static void send_hid(void) {
     uint32_t now_ms = board_millis();
     bool changed = (memcmp(rep, prev, sizeof(rep)) != 0);
 
-    /* Enviar apenas cambia algo, mas un latido cada 20 ms para que el
+    /* Enviar apenas cambia algo, mas un latido periodico para que el
      * host nunca crea que el dispositivo se colgo. */
-    if (changed || (now_ms - last_tx_ms) >= 20) {
+    if (changed || (uint32_t)(now_ms - last_tx_ms) >= HID_HEARTBEAT_MS) {
         tud_hid_report(0, rep, sizeof(rep));
         memcpy(prev, rep, sizeof(rep));
         last_tx_ms = now_ms;
@@ -294,22 +103,19 @@ static void publish_ui(void) {
     static uint16_t hid_hz      = 0;
 
     uint32_t now_ms = board_millis();
-    if ((now_ms - last_pub_ms) < 20) return;   /* 50 Hz basta para un OLED */
+    if ((uint32_t)(now_ms - last_pub_ms) < 20u) return;   /* 50 Hz */
     last_pub_ms = now_ms;
 
-    if ((now_ms - last_hz_ms) >= 1000) {
-        hid_hz       = (uint16_t)g_hid_count;
-        g_hid_count  = 0;
-        last_hz_ms   = now_ms;
+    if ((uint32_t)(now_ms - last_hz_ms) >= 1000u) {
+        hid_hz      = (uint16_t)g_hid_count;
+        g_hid_count = 0;
+        last_hz_ms  = now_ms;
     }
 
-    uint8_t rep[HID_REPORT_LEN];
-    build_report(rep);
-
     ui_publish_begin();
-    for (uint i = 0; i < CH_COUNT; i++) {
-        channel_t *ch = &chan[i];
-        memcpy(&ui_state.axis[i], &rep[i * 2], sizeof(int16_t));
+    for (uint32_t i = 0; i < CH_COUNT; i++) {
+        const channel_t *ch = &chan[i];
+        ui_state.axis[i]     = channel_axis(i);
         ui_state.ticks[i]    = ch->last_ticks;
         ui_state.lo[i]       = ch->lo;
         ui_state.ctr[i]      = ch->ctr;
@@ -322,6 +128,13 @@ static void publish_ui(void) {
     ui_state.usb_mounted   = tud_mounted();
     ui_state.usb_suspended = tud_suspended();
     ui_state.hid_hz        = hid_hz;
+    ui_state.mode          = (uint8_t)s_mode;
+    ui_state.failsafe      = inputs_failsafe();
+    ui_state.frame_lost    = inputs_frame_lost();
+    ui_state.frames_bad    = inputs_frames_bad();
+
+    memcpy(ui_state.flash_msg, s_flash_msg, sizeof(ui_state.flash_msg));
+    ui_state.flash_until_ms = s_flash_until;
     ui_publish_end();
 }
 
@@ -329,22 +142,66 @@ static void publish_ui(void) {
 /* Consola CDC                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Formateo de ticks a microsegundos sin coma flotante.
+ *
+ * El v1 usaba %.1f en print_status. En newlib-nano el soporte de
+ * coma flotante en printf viene desactivado salvo que se pida
+ * explicitamente, asi que ese formato podia imprimir basura. El
+ * display ya evitaba %f por este mismo motivo; aca faltaba. */
+static void fmt_us(char *out, size_t n, uint32_t ticks) {
+    uint32_t d = ticks / (TICKS_PER_US / 10u);   /* decimas de us */
+    snprintf(out, n, "%lu.%lu", (unsigned long)(d / 10u),
+                                (unsigned long)(d % 10u));
+}
+
+static void cdc_puts(const char *s) {
+    tud_cdc_write_str(s);
+    tud_cdc_write_flush();
+}
+
 static void print_status(void) {
-    char buf[256];
-    for (uint i = 0; i < CH_COUNT; i++) {
-        channel_t *ch = &chan[i];
-        int n = snprintf(buf, sizeof(buf),
-            "CH%u link=%d cal=%d  lo=%u ctr=%u hi=%u ticks"
-            "  (%.1f/%.1f/%.1f us)  frame=%u us  malos=%u\n",
-            (unsigned)(i + 1), (int)ch->linked, (int)ch->centered,
-            (unsigned)ch->lo, (unsigned)ch->ctr, (unsigned)ch->hi,
-            ch->lo / (double)TICKS_PER_US,
-            ch->ctr / (double)TICKS_PER_US,
-            ch->hi / (double)TICKS_PER_US,
-            (unsigned)ch->frame_us, (unsigned)ch->bad_count);
+    char buf[200], a[12], b[12], c[12];
+
+    int n = snprintf(buf, sizeof(buf),
+        "# modo=%s  enlace=%d  failsafe=%d  tramas ok=%lu malas=%lu\n",
+        mode_name(s_mode), (int)channels_link_ok(), (int)inputs_failsafe(),
+        (unsigned long)inputs_frames_ok(), (unsigned long)inputs_frames_bad());
+    if (n > 0) tud_cdc_write(buf, (uint32_t)n);
+
+    for (uint32_t i = 0; i < CH_COUNT; i++) {
+        const channel_t *ch = &chan[i];
+        fmt_us(a, sizeof(a), ch->lo);
+        fmt_us(b, sizeof(b), ch->ctr);
+        fmt_us(c, sizeof(c), ch->hi);
+
+        n = snprintf(buf, sizeof(buf),
+            "CH%lu link=%d cal=%d  lo=%lu ctr=%lu hi=%lu ticks"
+            "  (%s/%s/%s us)  frame=%lu us  malos=%lu\n",
+            (unsigned long)(i + 1), (int)ch->linked, (int)ch->centered,
+            (unsigned long)ch->lo, (unsigned long)ch->ctr,
+            (unsigned long)ch->hi, a, b, c,
+            (unsigned long)ch->frame_us, (unsigned long)ch->bad_count);
+        if (n > 0) tud_cdc_write(buf, (uint32_t)n);
+    }
+
+    if (s_mode == MODE_SBUS) {
+        n = snprintf(buf, sizeof(buf), "# sbus byte de cierre = 0x%02X\n",
+                     inputs_end_byte());
         if (n > 0) tud_cdc_write(buf, (uint32_t)n);
     }
     tud_cdc_write_flush();
+}
+
+static void do_save(void) {
+    if (!channels_all_centered()) {
+        cdc_puts("# nada que guardar: falta calibrar\n");
+        set_flash_msg("SIN CAL");
+        return;
+    }
+    bool ok = calstore_save(s_mode);
+    cdc_puts(ok ? "# calibracion guardada en flash\n"
+                : "# ERROR al guardar en flash\n");
+    set_flash_msg(ok ? "GUARDADO" : "ERROR");
 }
 
 static void poll_cdc(void) {
@@ -354,72 +211,121 @@ static void poll_cdc(void) {
     switch (c) {
     case 'd':
         dump_enabled = !dump_enabled;
-        tud_cdc_write_str(dump_enabled ? "# dump ON  (canal,ticks,frame_us)\n"
-                                       : "# dump OFF\n");
-        tud_cdc_write_flush();
+        cdc_puts(dump_enabled ? "# dump ON  (canal,ticks,frame_us)\n"
+                              : "# dump OFF\n");
         break;
     case 'c':
-        request_recalibration();
-        tud_cdc_write_str("# recalibrando: deja los controles en neutro\n");
-        tud_cdc_write_flush();
+        channels_reset_cal();
+        cdc_puts("# recalibrando: deja los controles en neutro\n");
+        set_flash_msg("RECAL");
         break;
     case 's':
         print_status();
         break;
+    case 'w':
+        do_save();
+        break;
+    case 'e':
+        cdc_puts(calstore_erase() ? "# flash de calibracion borrada\n"
+                                  : "# ERROR al borrar\n");
+        set_flash_msg("BORRADA");
+        break;
     case '?':
-        tud_cdc_write_str("# d=dump  c=recalibrar  s=estado\n");
-        tud_cdc_write_flush();
+        cdc_puts("# d=dump  c=recalibrar  s=estado  w=guardar  e=borrar\n");
         break;
     default:
         break;
     }
 }
 
-/* ------------------------------------------------------------------ */
+static void dump_channels(void) {
+    static uint32_t prev_ticks[CH_COUNT];
+    if (!dump_enabled || !tud_cdc_connected()) return;
+
+    bool any = false;
+    for (uint32_t i = 0; i < CH_COUNT; i++) {
+        if (chan[i].last_ticks == prev_ticks[i]) continue;
+        prev_ticks[i] = chan[i].last_ticks;
+
+        char line[48];
+        int n = snprintf(line, sizeof(line), "%lu,%lu,%lu\n",
+                         (unsigned long)i,
+                         (unsigned long)chan[i].last_ticks,
+                         (unsigned long)chan[i].frame_us);
+        if (n > 0) tud_cdc_write(line, (uint32_t)n);
+        any = true;
+    }
+    if (any) tud_cdc_write_flush();
+}
 
 /* ------------------------------------------------------------------ */
-/* Botón físico de recalibración                                       */
+/* Botón físico CAL                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Antirrebote simple por tiempo: un flanco de bajada valido dispara
- * la recalibracion una sola vez, y no vuelve a disparar hasta que el
- * boton se suelta y se estabiliza. Costo: una lectura de GPIO por
- * vuelta del bucle principal, nada comparable al camino PIO -> HID. */
+/*
+ * Corta: recalibrar. Larga: guardar en flash.
+ *
+ * La accion larga se dispara al cumplirse el tiempo, con el boton aun
+ * apretado, y no al soltarlo. Asi el usuario recibe la confirmacion en
+ * el OLED mientras sigue presionando y sabe que ya puede soltar, en vez
+ * de tener que adivinar cuanto es "largo".
+ */
 static void poll_cal_button(void) {
-    static bool     pressed_state = false;   /* filtrado */
-    static bool     raw_prev      = true;    /* true = suelto (pull-up) */
-    static uint32_t edge_ms       = 0;
+    static bool     stable   = false;   /* estado filtrado: true = apretado */
+    static bool     raw_prev = true;    /* true = suelto (pull-up)          */
+    static uint32_t edge_ms  = 0;
+    static uint32_t down_ms  = 0;
+    static bool     long_done = false;
 
-    bool raw = gpio_get(PIN_CAL_BUTTON);      /* true = suelto */
-    uint32_t now = board_millis();
+    bool     raw    = gpio_get(PIN_CAL_BUTTON);   /* true = suelto */
+    uint32_t now_ms = board_millis();
 
     if (raw != raw_prev) {
-        edge_ms  = now;
+        edge_ms  = now_ms;
         raw_prev = raw;
     }
 
-    if ((now - edge_ms) >= CAL_DEBOUNCE_MS) {
-        bool now_pressed = !raw;
-        if (now_pressed && !pressed_state) {
-            request_recalibration();
-        }
-        pressed_state = now_pressed;
+    if ((uint32_t)(now_ms - edge_ms) < CAL_DEBOUNCE_MS) return;
+
+    bool pressed = !raw;
+
+    if (pressed && !stable) {            /* flanco de bajada filtrado */
+        down_ms   = now_ms;
+        long_done = false;
+    } else if (pressed && !long_done &&
+               (uint32_t)(now_ms - down_ms) >= CAL_LONG_MS) {
+        do_save();
+        long_done = true;
+    } else if (!pressed && stable && !long_done) {
+        channels_reset_cal();
+        set_flash_msg("RECAL");
     }
+
+    stable = pressed;
 }
 
 /* ------------------------------------------------------------------ */
 
 int main(void) {
     board_init();
-    tusb_init();
 
     gpio_init(PIN_CAL_BUTTON);
     gpio_set_dir(PIN_CAL_BUTTON, GPIO_IN);
     gpio_pull_up(PIN_CAL_BUTTON);
 
-    uint offset = pio_add_program(pio, &pwm_capture_program);
-    channel_init(&chan[0], PIN_CH1, 0, INVERT_CH1, offset);
-    channel_init(&chan[1], PIN_CH2, 1, INVERT_CH2, offset);
+    /* El modo se resuelve antes de tocar ningun periferico: de el
+     * depende si se arma el PIO o la UART, y no tiene sentido dejar
+     * ambos configurados compitiendo por pines. */
+    s_mode = mode_read();
+
+    channels_init(s_mode);
+    inputs_init(s_mode);
+
+    /* Si hay calibracion guardada para este modo, se usa de entrada y
+     * el adaptador queda operativo sin pasar por el neutro. */
+    calstore_load(s_mode);
+
+    tusb_init();
 
     /* El OLED entero vive en core1. Core0 no lo toca nunca. */
     multicore_launch_core1(display_core1_main);
@@ -428,7 +334,8 @@ int main(void) {
         tud_task();
         poll_cdc();
         poll_cal_button();
-        poll_channels();
+        inputs_poll(time_us_32());
+        dump_channels();
         send_hid();
         publish_ui();
     }

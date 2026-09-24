@@ -24,9 +24,20 @@ typedef struct {
     uint32_t bad[2];
     bool     linked[2];
     bool     centered[2];
+
     bool     usb_mounted;
     bool     usb_suspended;
     uint16_t hid_hz;         /* reportes por segundo       */
+
+    uint8_t  mode;           /* rx_mode_t                  */
+    bool     failsafe;       /* solo S.BUS lo sabe de veras */
+    bool     frame_lost;
+    uint32_t frames_bad;     /* tramas descartadas          */
+
+    /* Mensaje efimero en la barra inferior: confirmaciones de guardado
+     * o borrado de calibracion. Vive unos segundos y se apaga solo. */
+    char     flash_msg[10];
+    uint32_t flash_until_ms;
 } ui_state_t;
 
 extern volatile uint32_t ui_seq;
