@@ -1,0 +1,51 @@
+;
+; pwm_capture.pio — medición de ancho de pulso RC con una state machine PIO
+;
+; Cada iteración del lazo de conteo son exactamente 2 ciclos de PIO.
+; Con el PIO a 100 MHz => 1 tick = 20 ns => 50 ticks por microsegundo.
+;
+; El paso de cuantización del receptor DSMR es del orden de 0,6 us,
+; o sea ~30 ticks. La medición queda unas 30 veces mas fina que la
+; señal, que es exactamente lo que queremos: el ruido que midas es
+; del receptor, no tuyo.
+;
+; Config requerida: in_pins y jmp_pin apuntando al mismo GPIO.
+;
+
+.program pwm_capture
+
+.wrap_target
+    wait 0 pin 0            ; sincronizar en nivel bajo
+    wait 1 pin 0            ; flanco de subida
+    mov  x, ~null           ; x = 0xFFFFFFFF
+count:
+    jmp  x--, test          ; 1 ciclo (x nunca llega a 0 en la practica)
+test:
+    jmp  pin, count         ; 1 ciclo: repetir mientras el pin siga alto
+    mov  isr, ~x            ; ISR = numero de iteraciones = ticks
+    push noblock            ; no bloquear si el consumidor se atrasa
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void pwm_capture_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, float pio_clk_hz) {
+    pio_sm_config c = pwm_capture_program_get_default_config(offset);
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);  // entrada
+
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_shift(&c, false, false, 32);            // sin autopush
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);           // FIFO RX de 8
+
+    float div = (float)clock_get_hz(clk_sys) / pio_clk_hz;
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
