@@ -31,12 +31,26 @@ rev1 quedándose en modo PWM.
 
 ---
 
-## Por qué funciona con cualquier marca
+## Alcance: qué receptores sirven
 
-Cada fabricante usa su propio protocolo de radio: DSMR en Spektrum,
-AFHDS 3 en FlySky, T-FHSS en Futaba, FH5 en Sanwa. Son propietarios,
-cerrados y, salvo los de Spektrum, sin implementaciones abiertas
-maduras.
+RX2JOY funciona con **cualquier receptor que entregue PWM, S.BUS o
+i-BUS dentro de la envolvente eléctrica admitida**. No depende del
+protocolo de radio, porque ese enlace queda encerrado dentro del
+receptor y el adaptador nunca lo ve. Lo que lee es la salida del
+receptor, que sí está estandarizada.
+
+Dos límites explícitos:
+
+- *Eléctrico.* Hasta la rev3, la entrada serial de 5 V se apoya en los
+  diodos de protección del RP2040 (ver Niveles eléctricos). Medir antes
+  de conectar.
+- *De formato.* Un receptor que solo saque un bus propietario sin
+  modo PWM, S.BUS ni i-BUS queda fuera de alcance.
+  
+Cada fabricante usa su propio protocolo de radio, y varios conviven
+dentro de una misma marca: DSM2/DSMR en Spektrum, AFHDS / AFHDS2A /
+AFHDS3 en FlySky según radio y receptor, FASST/T-FHSS/T-FHSS SR en
+Futaba, FH3/FH4/FH5 en Sanwa.
 
 El truco es que **ese enlace queda encerrado dentro del receptor**.
 RX2JOY nunca lo ve. Lo que lee es la salida del receptor, que sí está
@@ -313,6 +327,7 @@ del firmware de gen1 y las decisiones de diseño.
 |---|---|---|---|
 | Spektrum | SR2000 | PWM | Probado |
 | FlySky | serie FGr4 | i-BUS | Por probar |
+| FlySky | GT3C + GR3E | PWM | Por probar |
 | Futaba | con puerto S.BUS | S.BUS | Por probar |
 | Sanwa | con puerto SSR | PWM | Por probar |
 
