@@ -1,5 +1,7 @@
 # DX4R PRO Sim Adapter — Firmware + PCB V1
 
+![PCB del proyecto](gen1.jpeg)
+
 DX4R Pro → SR2000 (5,5 ms) → Raspberry Pi Pico / RP2040 → USB HID → VRC Pro
 
 Adaptador de baja latencia para utilizar una radio **Spektrum DX4R Pro** con
