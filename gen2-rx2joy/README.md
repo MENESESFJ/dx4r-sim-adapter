@@ -1,5 +1,11 @@
 # RX2JOY — gen2
 
+##Yusleidy Gen2 Rev1 VERSION 1 (Spektrum PWM)
+![Yusleidy](gen2.rev1.jpeg)
+
+##UART Gen2 RX2JOY Rev1 VERSION 2 (Multimarca PWM/S.BUS/i.BUS)
+![UART](gen2.rev2.jpeg)
+
 Adaptador USB multimarca para simuladores de RC de superficie.
 Convierte la salida de casi cualquier receptor de superficie en un
 joystick USB HID, sin drivers ni software intermedio.
